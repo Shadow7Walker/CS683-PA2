@@ -1,0 +1,116 @@
+#include "cache.h"
+#include <iomanip>
+
+#define maxRRPV 3
+
+// 2-bit RRPV counter per L2 cache block:
+// 0: Near-immediate re-reference (highest priority / retention)
+// 1: Intermediate near re-reference (assigned to newly inserted instruction lines)
+// 2: Intermediate distant re-reference (assigned to newly inserted data lines)
+// 3: Distant re-reference (eviction candidate)
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// Statistics to observe I-RRIP behavior
+static uint64_t instr_insertions = 0;
+static uint64_t data_insertions = 0;
+static uint64_t instr_hits = 0;
+static uint64_t data_hits = 0;
+static uint64_t instr_evictions = 0;
+static uint64_t data_evictions = 0;
+
+// Initialize replacement state for L2C
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Instruction-Conscious RRIP (I-RRIP) state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV; // All ways start at distant re-reference (empty/evictable)
+        }
+    }
+}
+
+// Find replacement victim
+// Prioritizes evicting non-instruction (data) blocks over instruction blocks
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // Step 0: Check for any invalid line first
+    for (int i = 0; i < L2C_WAY; i++) {
+        if (!current_set[i].valid) {
+            return i;
+        }
+    }
+
+    // Step 1: Eviction loop with instruction prioritization
+    while (1) {
+        // Priority 1A: Look for a non-instruction (data) line at maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV && current_set[i].instruction == 0) {
+                data_evictions++;
+                return i;
+            }
+        }
+
+        // Priority 1B: If no data line has maxRRPV, evict an instruction line at maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV && current_set[i].instruction == 1) {
+                instr_evictions++;
+                return i;
+            }
+        }
+
+        // Priority 2: Aging step - increment all RRPV values until at least one reaches maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            l2_rrpv[set][i]++;
+        }
+    }
+
+    // Should never reach here
+    assert(0);
+    return 0;
+}
+
+// Called on every cache hit and cache fill
+// Implements instruction-conscious insertion and promotion
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        // PROMOTION POLICY:
+        // Cache hits demonstrate temporal locality.
+        // Instruction hits are promoted to RRPV 0 (near-immediate re-reference, highest priority).
+        // Data hits are also promoted to RRPV 0 so frequently reused data lines are not prematurely evicted.
+        if (isInstruction) {
+            l2_rrpv[set][way] = 0;
+            instr_hits++;
+        } else {
+            l2_rrpv[set][way] = 0;
+            data_hits++;
+        }
+    } else {
+        // INSERTION POLICY:
+        // Prioritize instruction lines over data lines at insertion.
+        // Instruction lines are inserted with RRPV = 1 (intermediate near re-reference),
+        // giving them two aging cycles (1 -> 2 -> 3) before becoming eligible for eviction.
+        // Data lines are inserted with RRPV = maxRRPV - 1 = 2 (intermediate distant re-reference),
+        // making them vulnerable to eviction after only one aging cycle.
+        if (isInstruction) {
+            l2_rrpv[set][way] = 1;
+            instr_insertions++;
+        } else {
+            l2_rrpv[set][way] = maxRRPV - 1; // 2
+            data_insertions++;
+        }
+    }
+}
+
+// Print custom stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "--- L2C I-RRIP Final Stats ---" << endl;
+    cout << "Instruction Insertions: " << instr_insertions << ", Data Insertions: " << data_insertions << endl;
+    cout << "Instruction Hits:       " << instr_hits << ", Data Hits:       " << data_hits << endl;
+    cout << "Instruction Evictions:  " << instr_evictions << ", Data Evictions:  " << data_evictions << endl;
+}

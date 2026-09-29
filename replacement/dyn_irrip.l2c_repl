@@ -1,0 +1,220 @@
+#include "cache.h"
+#include <iomanip>
+
+#define maxRRPV 3
+
+// Sensitivity threshold for Set-Dueling Dynamic I-RRIP:
+// Ratio = (instr_access + instr_miss) / (total_access + total_miss)
+// If ratio > DYN_THRESHOLD, follower sets use I-RRIP; otherwise regular RRIP.
+#ifndef DYN_THRESHOLD
+#define DYN_THRESHOLD 0.25
+#endif
+
+// Set-Dueling configuration:
+// 32 uniformly spaced leader sets out of 1024 L2C sets (3.125% overhead).
+// Leader sets are sets where: (set % 32 == 0).
+// Leader sets always execute standard RRIP to provide an unbiased baseline.
+#define NUM_LEADER_SETS 32
+#define LEADER_INTERVAL (L2C_SET / NUM_LEADER_SETS)
+
+static inline bool is_leader_set(uint32_t set)
+{
+    return (set % LEADER_INTERVAL == 0);
+}
+
+// 2-bit RRPV counter per L2 cache block:
+// 0: Near-immediate re-reference (highest priority / retention)
+// 1: Intermediate near re-reference (assigned to instruction lines in I-RRIP)
+// 2: Intermediate distant re-reference (assigned to data / demand lines in RRIP)
+// 3: Distant re-reference (assigned to speculative prefetch lines or evictable)
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// Set-Dueling Tracking Counters for Leader Sets
+static uint64_t leader_instr_access = 0;
+static uint64_t leader_instr_miss = 0;
+static uint64_t leader_total_access = 0;
+static uint64_t leader_total_miss = 0;
+
+// Dynamic status tracking
+static uint64_t follower_irrip_cycles = 0;
+static uint64_t follower_rrip_cycles = 0;
+static uint64_t pf_insertions = 0;
+static uint64_t pf_hits = 0;
+
+// Initialize replacement state for L2C
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP (Dyn-IRRIP) for L2C with Threshold = "
+         << DYN_THRESHOLD << " (" << NUM_LEADER_SETS << " leader sets)" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+
+    leader_instr_access = 0;
+    leader_instr_miss = 0;
+    leader_total_access = 0;
+    leader_total_miss = 0;
+}
+
+// Compute the current instruction pressure ratio from leader sets
+static inline double get_instruction_pressure_ratio()
+{
+    uint64_t total = leader_total_access + leader_total_miss;
+    if (total < 100) {
+        // Warmup default: assume moderate instruction pressure
+        return 0.50;
+    }
+    return (double)(leader_instr_access + leader_instr_miss) / (double)total;
+}
+
+// Find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // Step 0: If there is an invalid line, choose it immediately
+    for (int i = 0; i < L2C_WAY; i++) {
+        if (!current_set[i].valid) {
+            return i;
+        }
+    }
+
+    bool is_leader = is_leader_set(set);
+    bool use_irrip = false;
+
+    if (!is_leader) {
+        double ratio = get_instruction_pressure_ratio();
+        use_irrip = (ratio > DYN_THRESHOLD);
+    }
+
+    // Step 1: Eviction Search
+    while (1) {
+        if (use_irrip) {
+            // Task 3: Prefetch awareness - evict unused speculative prefetch lines first
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && current_set[i].prefetch && !current_set[i].used) {
+                    return i;
+                }
+            }
+
+            // Task 2A/2B: In I-RRIP mode, prioritize evicting data lines over instruction lines
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && current_set[i].instruction == 0) {
+                    return i;
+                }
+            }
+
+            // If no data line at maxRRPV, evict instruction line at maxRRPV
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && current_set[i].instruction == 1) {
+                    return i;
+                }
+            }
+        } else {
+            // Standard RRIP mode (used by leader sets or when instruction pressure is low)
+            // Task 3: Still evict unused prefetch lines before demand lines if both at maxRRPV
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && current_set[i].prefetch && !current_set[i].used) {
+                    return i;
+                }
+            }
+
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV) {
+                    return i;
+                }
+            }
+        }
+
+        // Step 2: Aging step - increment all RRPVs until at least one reaches maxRRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            l2_rrpv[set][i]++;
+        }
+    }
+
+    assert(0);
+    return 0;
+}
+
+// Called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    bool is_leader = is_leader_set(set);
+
+    // Update Set-Dueling Tracking Counters if this access touches a leader set
+    if (is_leader) {
+        leader_total_access++;
+        if (isInstruction)
+            leader_instr_access++;
+
+        if (!hit) {
+            leader_total_miss++;
+            if (isInstruction)
+                leader_instr_miss++;
+        }
+
+        // Exponential decay filter every 8192 leader accesses to track workload phase changes
+        if (leader_total_access >= 8192) {
+            leader_instr_access >>= 1;
+            leader_instr_miss >>= 1;
+            leader_total_access >>= 1;
+            leader_total_miss >>= 1;
+        }
+    }
+
+    // Determine operating mode for follower sets
+    bool use_irrip = false;
+    if (!is_leader) {
+        double ratio = get_instruction_pressure_ratio();
+        use_irrip = (ratio > DYN_THRESHOLD);
+        if (use_irrip)
+            follower_irrip_cycles++;
+        else
+            follower_rrip_cycles++;
+    }
+
+    if (hit) {
+        // PROMOTION POLICY:
+        // Cache hits prove line utility. Both instruction and data hits are promoted to RRPV = 0.
+        // Task 3: Prefetched lines that hit are now validated as useful, promoting to RRPV = 0.
+        l2_rrpv[set][way] = 0;
+        if (type == PREFETCH)
+            pf_hits++;
+    } else {
+        // INSERTION POLICY:
+        if (type == PREFETCH) {
+            // Task 3: Prefetch awareness
+            // Speculative prefetch lines inserted with maxRRPV (3) to prevent polluting
+            // high-priority instruction and demand data working sets.
+            l2_rrpv[set][way] = maxRRPV;
+            pf_insertions++;
+        } else if (use_irrip) {
+            // I-RRIP Insertion Mode:
+            // Instruction lines given priority RRPV = 1 (2 aging cycles).
+            // Data lines given RRPV = maxRRPV - 1 = 2 (1 aging cycle).
+            if (isInstruction)
+                l2_rrpv[set][way] = 1;
+            else
+                l2_rrpv[set][way] = maxRRPV - 1; // 2
+        } else {
+            // Standard RRIP Insertion Mode:
+            // Both instruction and data lines inserted with RRPV = maxRRPV - 1 = 2.
+            l2_rrpv[set][way] = maxRRPV - 1; // 2
+        }
+    }
+}
+
+// Print custom stats
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "--- L2C Dynamic I-RRIP Final Stats (Threshold: " << DYN_THRESHOLD << ") ---" << endl;
+    cout << "Leader Total Accesses: " << leader_total_access << ", Misses: " << leader_total_miss << endl;
+    cout << "Leader Instr Accesses: " << leader_instr_access << ", Misses: " << leader_instr_miss << endl;
+    cout << "Final Instruction Pressure Ratio: " << get_instruction_pressure_ratio() << endl;
+    cout << "Follower I-RRIP Accesses: " << follower_irrip_cycles << ", RRIP Accesses: " << follower_rrip_cycles << endl;
+    cout << "Prefetch Insertions: " << pf_insertions << ", Prefetch Hits: " << pf_hits << endl;
+}

@@ -1,0 +1,26 @@
+# Build output and intermediate directories
+bin/
+obj/
+
+# Object files, dependency files, and libraries
+*.o
+*.d
+*.a
+*.so
+
+# Editor, sed, and temporary backup files
+*.bak
+*.cp
+sed*
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Compressed archives and traces
+*.tar.gz
+*.gz
+*.zip
+
+# Intermediate report HTML
+Summary.html

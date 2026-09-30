@@ -57,6 +57,10 @@ void CACHE::l2c_initialize_replacement()
     leader_instr_miss = 0;
     leader_total_access = 0;
     leader_total_miss = 0;
+    follower_irrip_cycles = 0;
+    follower_rrip_cycles = 0;
+    pf_insertions = 0;
+    pf_hits = 0;
 }
 
 // Compute the current instruction pressure ratio from leader sets
@@ -146,7 +150,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     bool is_leader = is_leader_set(set);
 
     // Update Set-Dueling Tracking Counters if this access touches a leader set
-    if (is_leader) {
+    // Task 3: Prefetch awareness - only demand accesses (loads/RFOs/translations) reflect true instruction vs data pressure
+    if (is_leader && (type != PREFETCH) && (type != PREFETCH_TRANSLATION)) {
         leader_total_access++;
         if (isInstruction)
             leader_instr_access++;
@@ -179,11 +184,14 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
     if (hit) {
         // PROMOTION POLICY:
-        // Cache hits prove line utility. Both instruction and data hits are promoted to RRPV = 0.
-        // Task 3: Prefetched lines that hit are now validated as useful, promoting to RRPV = 0.
-        l2_rrpv[set][way] = 0;
-        if (type == PREFETCH)
+        // Cache hits prove line utility. Both instruction and demand data hits are promoted to RRPV = 0.
+        // Task 3: Only demand hits validate a line as useful and promote to RRPV = 0.
+        // Redundant prefetch hits do not promote speculative lines over high-priority instructions.
+        if (type != PREFETCH) {
+            l2_rrpv[set][way] = 0;
+        } else {
             pf_hits++;
+        }
     } else {
         // INSERTION POLICY:
         if (type == PREFETCH) {

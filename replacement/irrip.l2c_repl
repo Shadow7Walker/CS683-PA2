@@ -28,6 +28,13 @@ void CACHE::l2c_initialize_replacement()
             l2_rrpv[i][j] = maxRRPV; // All ways start at distant re-reference (empty/evictable)
         }
     }
+
+    instr_insertions = 0;
+    data_insertions = 0;
+    instr_hits = 0;
+    data_hits = 0;
+    instr_evictions = 0;
+    data_evictions = 0;
 }
 
 // Find replacement victim

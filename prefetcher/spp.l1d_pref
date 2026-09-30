@@ -112,26 +112,25 @@ static inline void evaluate_throttling() {
         double acc = (double)interval_useful / (double)interval_issued;
 
         // Degree scaling based on accuracy to prevent cache pollution:
-        // - High accuracy (>= 70%): Aggressive prefetch degree 4
-        // - Good accuracy (50% - 69%): Degree 3
-        // - Moderate accuracy (30% - 49%): Degree 2
-        // - Low accuracy (15% - 29%): Conservative degree 1
-        // - Very low accuracy (< 15%): Throttle prefetcher (degree 0)
-        if (acc >= 0.70) {
+        // - High accuracy (>= 50%): Aggressive prefetch degree 4
+        // - Good accuracy (35% - 49%): Degree 3
+        // - Moderate accuracy (20% - 34%): Degree 2
+        // - Low accuracy (< 20%): Conservative degree 1 (probes single next-line to avoid deadlock)
+        if (acc >= 0.50) {
             current_degree = 4;
-        } else if (acc >= 0.50) {
+        } else if (acc >= 0.35) {
             current_degree = 3;
-        } else if (acc >= 0.30) {
+        } else if (acc >= 0.20) {
             current_degree = 2;
-        } else if (acc >= 0.15) {
-            current_degree = 1;
         } else {
-            current_degree = 0;
+            current_degree = 1;
         }
 
         // Decay interval counters with a moving-average window
         interval_issued >>= 1;
         interval_useful >>= 1;
+        if (interval_useful > interval_issued)
+            interval_useful = interval_issued;
     }
 }
 
@@ -153,6 +152,11 @@ void CACHE::l1d_prefetcher_initialize()
     for (int i = 0; i < FILTER_COUNT; i++) {
         pf_filter[i].valid = false;
     }
+    total_issued_count = 0;
+    total_useful_count = 0;
+    interval_issued = 0;
+    interval_useful = 0;
+    filter_head = 0;
     current_degree = 2;
 }
 
@@ -260,20 +264,26 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             // ================================================================
             int64_t u_stride = st[match_idx].uniform_stride;
             for (uint32_t d = 1; d <= degree; d++) {
-                uint64_t pf_cl = cl_addr + (d * u_stride);
+                int64_t target_cl = (int64_t)cl_addr + (d * u_stride);
+                if (target_cl <= 0)
+                    break;
+
+                uint64_t pf_cl = (uint64_t)target_cl;
                 uint64_t pf_addr = pf_cl << LOG2_BLOCK_SIZE;
 
                 // Functional Constraint: Never cross the 4KB OS page boundary
                 if ((pf_addr >> LOG2_PAGE_SIZE) != base_page)
                     break;
 
+                int res = 0;
                 // Dynamic MSHR check: prefetch to L1 if queue space permits, else L2
                 if (MSHR.occupancy < (MSHR.SIZE >> 1))
-                    prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+                    res = prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
                 else
-                    prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+                    res = prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
 
-                record_prefetch(pf_cl);
+                if (res)
+                    record_prefetch(pf_cl);
             }
         } else {
             // ================================================================
@@ -290,19 +300,25 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                     break;
 
                 int64_t pred_s = pt[cur_pt_idx].predicted_stride;
-                spec_cl += pred_s;
+                int64_t target_cl = (int64_t)spec_cl + pred_s;
+                if (target_cl <= 0)
+                    break;
+
+                spec_cl = (uint64_t)target_cl;
                 uint64_t pf_addr = spec_cl << LOG2_BLOCK_SIZE;
 
                 // Functional Constraint: Never cross the 4KB OS page boundary
                 if ((pf_addr >> LOG2_PAGE_SIZE) != base_page)
                     break;
 
+                int res = 0;
                 if (MSHR.occupancy < (MSHR.SIZE >> 1))
-                    prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+                    res = prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
                 else
-                    prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+                    res = prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
 
-                record_prefetch(spec_cl);
+                if (res)
+                    record_prefetch(spec_cl);
 
                 // Speculatively advance signature for multi-degree lookahead
                 spec_sig = hash_signature(spec_sig, pred_s);

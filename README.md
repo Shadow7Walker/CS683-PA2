@@ -9,7 +9,7 @@ Useful trace links:
 ## Clone the repository
 
 ```bash
-git clone https://github.com/cs683-iitb-autumn-2026/pa2.git
+git clone https://github.com/Shadow7Walker/CS683-PA2.git
 ```
 
 ## Compile
